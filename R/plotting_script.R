@@ -179,6 +179,8 @@ fig_s4 <- wrap_plots(plot_panels_invitees, ncol = 2, guides = "collect") +
 
 # Write images ------------------------------------------------------------------
 
+fs::dir_create("plots")
+
 # For 2x2 plots:
 ggsave(
   here::here("plots", "fig_3.png"),
