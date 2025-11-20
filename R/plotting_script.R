@@ -168,12 +168,12 @@ fig_3 <- wrap_plots(plot_panels_overall, ncol = 2, guides = "collect") +
 
 plot_panels_unweighted <- generate_plots(unweighted_table, text_size = text_size)
 fig_s3 <- wrap_plots(plot_panels_unweighted, ncol = 2, guides = "collect") +
-  plot_annotation(caption = "Odds Ratios (log scale)",
+  plot_annotation(caption = "Odds Ratios",
                   theme = theme(plot.caption = element_text(hjust = 0.36, size = text_size - 1)))
 
 plot_panels_invitees <- generate_plots(invitees_weighted_table, text_size = text_size)
 fig_s4 <- wrap_plots(plot_panels_invitees, ncol = 2, guides = "collect") +
-  plot_annotation(caption = "Odds Ratios (log scale)",
+  plot_annotation(caption = "Odds Ratios",
                   theme = theme(plot.caption = element_text(hjust = 0.36, size = text_size - 1)))
 
 
