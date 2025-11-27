@@ -1,0 +1,846 @@
+---
+title: "Analyses for the paper 'Changes in public perception of artificial intelligence in healthcare after exposure to ChatGPT'"
+author: "Anders Aasted Isaksen"
+format:
+    html:
+        embed-resources: true
+---
+
+## Load packages
+
+```{r}
+library(haven)
+library(readr)
+library(data.table)
+library(lubridate)
+library(here)
+library(finalfit)
+library(gridExtra)
+library(nnet)
+library(ggplot2)
+library(ggalluvial)
+library(dplyr)
+library(WeightIt)
+```
+
+# Load data
+
+```{r load}
+#| include: false
+
+# Load HICD data and label values from SAS formats and assign values from the labels:
+
+# 2024 survey:
+rmstenodiabetes2023_svar <-
+    haven::read_sas(
+        "E:/rawdata/707987/DST_survey_2024/rmstenodiabetes2023_svar.sas7bdat",
+        "E:/rawdata/707987/DST_survey_2024/rmstenodiabetes2023_formats.sas7bcat"
+    )
+
+
+survey_2024 <-
+    rmstenodiabetes2023_svar |> dplyr::mutate_if(sjlabelled::is_labelled, sjlabelled::as_label)
+
+setDT(survey_2024)
+
+# 2022 Survey (no sas formats file):
+survey_2022 <-
+    haven::read_sas("E:/rawdata/707987/Eksterne data/20220503/_20220426_hicd22.sas7bdat")
+setDT(survey_2022)
+
+
+# Achtung: 62 duplicate responses in 2022 from 31 individuals
+
+# Take .SD[1] to only keep one response per person.
+# Filter survey data and wrangle NAs in 2022 to account for q4=3 (haven't heard of AI))
+# True missing in q10 are only those missing in q4
+# q4==3 is a separate level of q10
+survey_2022_clean <-
+    survey_2022[, .SD[1], by = CPR][, .(
+        pnr = CPR,
+        heard_of_ai = factor(q4),
+        ai_perception_2022_raw = addNA(factor(q10))
+    )]
+
+survey_2022_clean[, ai_perception_2022 := fifelse(
+    is.na(heard_of_ai) |
+        (ai_perception_2022_raw == "NA" &
+             !is.na(heard_of_ai)),
+    NA,
+    ai_perception_2022_raw
+)]
+
+survey_2024_clean <-
+    survey_2024[, .(
+        pnr,
+        ai_perception_2024 = aiq1,
+        chatgpt_use = aiq2)]
+
+levels(survey_2022_clean$ai_perception_2022) <-
+    levels(survey_2024_clean$ai_perception_2024)
+
+```
+
+## Format response data
+
+```{r merge}
+#| include: false
+responses <- merge(survey_2024_clean[!(is.na(ai_perception_2024) |
+                                           is.na(chatgpt_use))],
+                   survey_2022_clean[!is.na(ai_perception_2022), .(pnr, ai_perception_2022)],
+                   by = "pnr",
+                   all = FALSE)
+
+# Format responses:
+levels(responses$chatgpt_use) <- c("ChatGPT use", "ChatGPT use", "No use", "No use")
+levels(responses$ai_perception_2022) <-
+    c("Benefits", "Equal", "Risks", "Don't know", "Don't know")
+levels(responses$ai_perception_2024) <-
+    c("Benefits", "Equal", "Risks", "Don't know", "Don't know")
+
+
+
+responses$ai_perception_2022 <- factor(responses$ai_perception_2022,
+                                       levels = c("Don't know", "Benefits", "Equal", "Risks"))
+responses$ai_perception_2024 <- factor(responses$ai_perception_2024,
+                                       levels = c("Don't know", "Benefits", "Equal", "Risks"))
+
+responses[, ai_perception_2022 := relevel(ai_perception_2022, ref = "Don't know")]
+responses[, ai_perception_2024 := relevel(ai_perception_2024, ref = "Don't know")]
+
+
+```
+
+## Transform to long format for alluvial plots
+
+```{r long-format}
+#| include: false
+
+## Long format:
+responses_long <- responses |> dplyr::mutate(pnr = dplyr::row_number()) |> tidyr::pivot_longer(
+    cols = tidyr::starts_with("ai_perception"),
+    names_to = "survey_year",
+    values_to = "ai_perception"
+)
+
+responses_long <-
+    responses_long |> dplyr::mutate(survey_year = factor(
+        stringr::str_extract(survey_year, "....$"),
+        levels = c("2022", "2024")
+    ))
+```
+
+## Function to add external covariates
+
+```{r covariates}
+#| include: false
+
+add_covariates <-
+    function(study_population,
+             index_year,
+             education_year) {
+        # Load data:
+        
+        # Bef
+        bef_data <-
+            readRDS(
+                paste0(
+                    "E:/workdata/707987/aai_workspace/osdc2023/data/raw/bef",
+                    index_year - 1,
+                    "12.sas7bdat.rds"
+                )
+            )
+        setDT(bef_data)
+        names(bef_data) <- tolower(names(bef_data))
+        bef_data <-
+            bef_data[, .(pnr, age = alder, sex = as.factor(ifelse(koen ==
+                                                                      '1', 'Men', 'Women')))]
+        
+        # Education:
+        edu_length_years <- function(education_year) {
+            edu_data <-
+                haven::read_sas(
+                    paste0(
+                        "E:/rawdata/707987/Grunddata/Leverance_3/POPB/udda",
+                        education_year,
+                        "09.sas7bdat"
+                    )
+                )
+            formats <-
+                read_sas(
+                    "E:/Formater/SAS formater i Danmarks Statistik/SAS_datasaet/Disced/n_audd_pria_l1lx_k.sas7bdat"
+                )
+            setDT(edu_data)
+            setDT(formats)
+            edu_length <-
+                merge(edu_data[, .(pnr = PNR, edu_code = HFAUDD)], formats[, .(
+                    edu_code = START,
+                    education_years = cut(
+                        as.numeric(AUDD_PRIA_L1LX_K) / 12,
+                        breaks = c(0, 10, 15, Inf),
+                        right = FALSE
+                    )
+                )], by = "edu_code", all.x = TRUE)
+            return(edu_length[, .(pnr, education_years)])
+        }
+        
+        education_data <- edu_length_years(education_year)
+        
+        # Diabetes
+        diabetes_data <-
+            readr::read_csv(
+                "E:/workdata/707987/_common/data/csv/diabetes_onset_imputed_hicd_2023.csv",
+                col_types = cols(
+                    diabetes_type = col_factor(levels = c("1", "2")),
+                    date_onset_diabetes_hicd = col_date(format = "%Y-%m-%d")
+                )
+            )
+        setDT(diabetes_data)
+        names(diabetes_data) <- tolower(names(diabetes_data))
+        diabetes_data <- diabetes_data[, .(pnr, prevalent_diabetes = date_onset_diabetes_hicd < as.Date(paste0(index_year, "-01-01")), diabetes_type)]
+        
+        # standardize colnames:
+        names(study_population) <- tolower(names(study_population))
+        
+        
+        
+        # Merge together:
+        output <- Reduce(
+            function(x, y)
+                merge(x, y, by = 'pnr', all.x = TRUE),
+            list(study_population, bef_data, education_data, diabetes_data)
+        )
+        
+        output[, diabetes := factor(ifelse(
+            is.na(prevalent_diabetes) |
+                prevalent_diabetes == FALSE,
+            "No diabetes",
+            diabetes_type
+        ))]
+        return(output)
+    }
+
+responses_covariates <-
+    add_covariates(
+        study_population = responses,
+        index_year = 2022,
+        education_year = 2021
+    )
+
+
+responses_covariates[, chatgpt_use := relevel(chatgpt_use, ref = "No use")]
+
+responses_covariates[, diabetes := relevel(diabetes, ref = "No diabetes")]
+levels(responses_covariates$diabetes) <- c("No diabetes", "T1D", "T2D")
+responses_covariates <- responses_covariates |> dplyr::mutate_all(sjlabelled::remove_label)
+
+```
+
+
+
+## Define function for regression analyses
+
+Main analysis with dynamic reference group to estimate change from baseline perception
+
+```{r dynamic-ref-levels-analysis}
+#| include: false
+
+dynamic_ref_regression_func <- function(input_data, weights = NULL) {
+    outcome_levels <- levels(input_data$ai_perception_2024)
+    
+    ref_levels_model_list <-
+        vector(mode = "list", length = 0)
+    
+    
+    
+    for (baseline_perception in levels(input_data$ai_perception_2022)) {
+        data_strata <- input_data[ai_perception_2022 == baseline_perception]
+        
+        
+        for (ref_level in outcome_levels) {
+            data_strata$ai_perception_2024 <-
+                relevel(data_strata$ai_perception_2024, ref = ref_level)
+            
+            ref_levels_model_list[[baseline_perception]][[ref_level]] <-
+                broom::tidy(
+                    multinom(
+                        ai_perception_2024 ~ chatgpt_use + sex + I(age / 10) + diabetes + education_years,
+                        data = data_strata,
+                        if (is.null(weights)) {
+                            weights = NULL
+                        } else {
+                            weights = get(weights)
+                        }
+                    ),
+                    conf.int = TRUE,
+                    exponentiate = TRUE
+                )
+            
+        }
+        
+    }
+    
+    ### Select models with the same baseline strata and outcome reference level
+    
+    matching_strata_outcome <-
+        vector(mode = "list", length = 0)
+    
+    for (baseline_strata in names(ref_levels_model_list)) {
+        matching_strata_outcome[[baseline_strata]] <-
+            ref_levels_model_list[[baseline_strata]][[baseline_strata]]
+        
+    }
+    
+    matching_strata_dt <-
+        data.table::rbindlist(matching_strata_outcome, idcol = "baseline_perception")
+    
+    # Add reference category values:
+    matching_strata_dt_ref <- rbind(
+        matching_strata_dt,
+        data.frame(
+            baseline_perception = rep(outcome_levels, 3),
+            y.level = rep(outcome_levels, 3),
+            term = c("chatgpt_useChatGPT use", "diabetesT1D", "diabetesT2D"),
+            estimate = rep(1, length(outcome_levels) * 3),
+            conf.low = rep(1, length(outcome_levels) * 3),
+            conf.high = rep(1, length(outcome_levels) * 3)
+        ),
+        fill = TRUE
+    )
+    
+    # Add helper variables:
+    matching_strata_dt_ref[, estimates_label := ifelse(
+        estimate != 1,
+        paste0(
+            round_tidy(estimate, 2),
+            " (",
+            round_tidy(conf.low, 2),
+            "-",
+            round_tidy(conf.high, 2),
+            ")"
+        ),
+        paste0("(ref)")
+    )]
+    
+    # Remove facet_wrap headers:
+    matching_strata_dt_ref[, baseline_perception_empty := factor(baseline_perception, labels = c(" ", " ", " ", " "))]
+    
+    return(matching_strata_dt_ref)
+}
+
+```
+
+## Create baseline tables
+
+```{r table-one}
+#| include: false
+
+# Exclude missing data:
+responses_covariates <-
+    responses_covariates[complete.cases(responses_covariates[, .(pnr,
+                                                                 ai_perception_2022,
+                                                                 ai_perception_2024,
+                                                                 age,
+                                                                 diabetes,
+                                                                 education_years)])]
+
+basetable <- responses_covariates |> summary_factorlist(
+    dependent = "chatgpt_use",
+    explanatory = c(
+        "sex",
+        "age",
+        "diabetes",
+        "education_years",
+        "ai_perception_2022",
+        "ai_perception_2024"
+    ),
+    column = TRUE,
+    total_col = TRUE,
+    add_col_totals = TRUE
+    
+)
+
+basetable_by_baseline_perception <- responses_covariates |> summary_factorlist(
+    dependent = "ai_perception_2022",
+    explanatory = c(
+        "sex",
+        "age",
+        "diabetes",
+        "education_years",
+        "ai_perception_2024",
+        "chatgpt_use"
+    ),
+    column = TRUE,
+    total_col = FALSE,
+    add_col_totals = TRUE
+    
+)
+
+summary_crosstable_chatgpt <- responses_covariates[chatgpt_use == "ChatGPT use"] |> summary_factorlist(
+    dependent = "ai_perception_2022",
+    explanatory = "ai_perception_2024",
+    column = TRUE,
+    total_col = FALSE,
+    add_col_totals = TRUE
+    
+)
+
+summary_crosstable_nonusers <- responses_covariates[chatgpt_use != "ChatGPT use"] |> summary_factorlist(
+    dependent = "ai_perception_2022",
+    explanatory = "ai_perception_2024",
+    column = TRUE,
+    total_col = FALSE,
+    add_col_totals = TRUE
+    
+)
+```
+
+## Create alluvial plots
+
+```{r}
+# Work-around for not wanting the reference category to be the first level:
+
+responses_covariates_alluvial <- responses_covariates
+responses_covariates_alluvial$ai_perception_2022 <- factor(
+    responses_covariates_alluvial$ai_perception_2022,
+    levels = c("Don't know", "Benefits", "Equal", "Risks")
+)
+responses_covariates_alluvial$ai_perception_2024 <- factor(
+    responses_covariates_alluvial$ai_perception_2024,
+    levels = c("Don't know", "Benefits", "Equal", "Risks")
+)
+
+responses_long <- responses_covariates_alluvial |> dplyr::mutate(pnr = dplyr::row_number()) |> tidyr::pivot_longer(
+    cols = tidyr::starts_with("ai_perception"),
+    names_to = "survey_year",
+    values_to = "ai_perception"
+)
+
+responses_long <-
+    responses_long |> dplyr::mutate(survey_year = factor(
+        stringr::str_extract(survey_year, "....$"),
+        levels = c("2022", "2024")
+    ))
+
+
+
+
+alluv_users <-
+    responses_long |> filter(chatgpt_use == "ChatGPT use") |> ggplot(aes(
+        x = survey_year,
+        stratum = ai_perception,
+        alluvium = pnr,
+        fill = ai_perception
+    )) +
+    geom_flow() +
+    geom_stratum(alpha = 0.5) +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank()) +
+    MetBrewer::scale_fill_met_d("Hiroshige", direction = "-1") +
+    labs(title = "ChatGPT exposed",
+         fill = "Perception of AI",
+         x = "",
+         y = "Individuals") +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        # axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold")
+    )
+
+alluv_nonusers <-
+    responses_long |> filter(chatgpt_use != "ChatGPT use") |> ggplot(aes(
+        x = survey_year,
+        stratum = ai_perception,
+        alluvium = pnr,
+        fill = ai_perception
+    )) +
+    geom_flow() +
+    geom_stratum(alpha = 0.5) +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank()) +
+    MetBrewer::scale_fill_met_d("Hiroshige", direction = "-1") +
+    labs(title = "Unexposed",
+         fill = "Perception of AI",
+         x = "",
+         y = "") +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        # axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold")
+    )
+
+```
+
+## Create weights
+
+```{r make-weights}
+
+# Weight study population to represent 2022 background population distributions of
+# age, sex, diabetes, education
+
+background_covariates <-
+    add_covariates(
+        study_population = as.data.table(
+            readRDS(
+                "E:/workdata/707987/aai_workspace/osdc2023/data/raw/bef202112.sas7bdat.rds"
+            )
+        )[, .(pnr)],
+        index_year = 2022,
+        education_year = 2021
+    )
+
+background_covariates[, in_study_pop := pnr %in% responses_covariates$pnr]
+background_covariates <- background_covariates[, .(pnr, age, sex, education_years, diabetes, in_study_pop)]
+background_covariates_targetpop <-
+    background_covariates[complete.cases(background_covariates) &
+                              age <= max(responses_covariates$age) &
+                              age >= min(responses_covariates$age)]
+
+
+# To create invitee-population weights: load the original invitee population in 2020:
+invitees_2020 <- read_sas("E:/rawdata/707987/Fra DST Survey/stenormdiabetes2020_stik_.sas7bdat")$pnr
+
+background_covariates_targetpop_invitees <- background_covariates_targetpop[pnr %in% invitees_2020]
+
+# Compute regression models for weighting:
+weightit_model_background <-
+    WeightIt::weightit(
+        in_study_pop ~ age + sex + diabetes + education_years,
+        data = background_covariates_targetpop,
+        method = "ps",
+        stabilize = TRUE
+    )
+
+weightit_model_invitees <-
+    WeightIt::weightit(
+        in_study_pop ~ age + sex + diabetes + education_years,
+        data = background_covariates_targetpop_invitees,
+        method = "ps",
+        stabilize = TRUE
+    )
+
+background_covariates_targetpop$weights_background <- weightit_model_background$weights
+
+background_covariates_targetpop_invitees$weights_invitees <- weightit_model_invitees$weights
+
+
+responses_weights <- Reduce(
+    function(x, y)
+        merge(x, y, by = 'pnr', all.x = TRUE),
+    list(
+        responses_covariates,
+        background_covariates_targetpop[, .(pnr, weights_background)],
+        background_covariates_targetpop_invitees[, .(pnr, weights_invitees)]
+    )
+)
+
+
+# Cap weights:
+responses_weights[, weights_background_capped := pmin(weights_background, quantile(weights_background, 0.95))]
+responses_weights[, weights_invitees_capped := pmin(weights_invitees, quantile(weights_invitees, 0.95))]
+
+# Rescale weights:
+responses_weights[, weights_background_rescaled := weights_background_capped /
+                      mean(weights_background_capped)]
+responses_weights[, weights_invitees_rescaled := weights_invitees_capped /
+                      mean(weights_invitees_capped)]
+
+```
+
+## Supplementary: unstratified regression analysis
+
+```{r overall-analysis-weights}
+#| eval: false
+
+# This analysis is adjusted for baseline perception, rather than stratified by it
+overall_analysis_weights <- broom::tidy(
+    multinom(
+        ai_perception_2024 ~ chatgpt_use + sex + I(age / 10) + diabetes + education_years + ai_perception_2022,
+        data = responses_weights,
+        weights = weights_invitees_rescaled
+    ),
+    conf.int = TRUE,
+    exponentiate = TRUE
+)
+```
+
+## Supplementary: weighted base table
+
+```{r}
+basetable_weighted <- responses_weights |> summary_factorlist(
+dependent = "chatgpt_use",
+explanatory = c(
+"sex",
+"age",
+"diabetes",
+"education_years",
+"ai_perception_2022",
+"ai_perception_2024"
+),
+column = TRUE,
+total_col = TRUE,
+add_col_totals = TRUE,
+weights = "weights_background_rescaled"
+
+)
+
+basetable_weighted_invitees <- responses_weights |> summary_factorlist(
+dependent = "chatgpt_use",
+explanatory = c(
+"sex",
+"age",
+"diabetes",
+"education_years",
+"ai_perception_2022",
+"ai_perception_2024"
+),
+column = TRUE,
+total_col = TRUE,
+add_col_totals = TRUE,
+weights = "weights_invitees_rescaled"
+)
+
+```
+
+
+
+## Crosstables
+
+```{r crosstables}
+
+## Create weighted cross-tables:
+
+responses_split <- split(responses_weights, responses_weights$chatgpt_use)
+
+format_crosstable <- function(subset_chatgpt_use, weighted = FALSE) {
+    # Counts & proportions
+    
+    if (weighted == TRUE) {
+        counts <- round(
+            xtabs(
+                weights_background_rescaled ~ ai_perception_2024 + ai_perception_2022,
+                data = subset_chatgpt_use
+            )
+        )
+    } else {
+        counts <- table(
+            subset_chatgpt_use$ai_perception_2024,
+            subset_chatgpt_use$ai_perception_2022
+        )
+    }
+    
+    
+    props <- prop.table(counts, margin = 2) * 100 # Column percentages
+    
+    # Formatting output:
+    formatted <- matrix(
+        paste0(counts, " (", round(props, 1), "%)"),
+        nrow = nrow(counts),
+        ncol = ncol(counts),
+        dimnames = dimnames(counts)
+    )
+    
+    # Add column sums:
+    col_sums <- colSums(counts)
+    
+    final_format <- rbind(Total = col_sums, formatted)
+    return(final_format)
+}
+
+unweighted_crosstabs <- lapply(responses_split, weighted = FALSE, format_crosstable)
+
+weighted_crosstabs <- lapply(responses_split, weighted = TRUE, format_crosstable)
+```
+
+## Supplementary: weighted alluvial plots
+
+```{r}
+## Long format:
+
+# Work-around for not wanting the reference category to be the first level:
+
+responses_weighted_alluvial <- responses_weights
+responses_weighted_alluvial$ai_perception_2022 <- factor(
+    responses_weighted_alluvial$ai_perception_2022,
+    levels = c("Don't know", "Benefits", "Equal", "Risks")
+)
+responses_weighted_alluvial$ai_perception_2024 <- factor(
+    responses_weighted_alluvial$ai_perception_2024,
+    levels = c("Don't know", "Benefits", "Equal", "Risks")
+)
+
+weighted_long <- responses_weighted_alluvial |> dplyr::mutate(pnr = dplyr::row_number()) |> tidyr::pivot_longer(
+    cols = tidyr::starts_with("ai_perception"),
+    names_to = "survey_year",
+    values_to = "ai_perception"
+)
+
+weighted_long <-
+    weighted_long |> dplyr::mutate(survey_year = factor(
+        stringr::str_extract(survey_year, "....$"),
+        levels = c("2022", "2024")
+    ))
+
+
+weighted_alluv_users <-
+    weighted_long |> filter(chatgpt_use == "ChatGPT use") |> ggplot(
+        aes(
+            x = survey_year,
+            stratum = ai_perception,
+            alluvium = pnr,
+            y = weights_background_rescaled,
+            fill = ai_perception
+        )
+    ) +
+    geom_flow() +
+    geom_stratum(alpha = 0.5) +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank()) +
+    MetBrewer::scale_fill_met_d("Hiroshige", direction = "-1") +
+    labs(title = "ChatGPT exposed",
+         fill = "Perception of AI",
+         x = "",
+         y = "Individuals") +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        # axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold")
+    )
+
+weighted_alluv_nonusers <-
+    weighted_long |> filter(chatgpt_use != "ChatGPT use") |> ggplot(
+        aes(
+            x = survey_year,
+            stratum = ai_perception,
+            alluvium = pnr,
+            y = weights_background_rescaled,
+            fill = ai_perception
+        )
+    ) +
+    geom_flow() +
+    geom_stratum(alpha = 0.5) +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_blank()) +
+    MetBrewer::scale_fill_met_d("Hiroshige", direction = "-1") +
+    labs(title = "Unexposed",
+         fill = "Perception of AI",
+         x = "",
+         y = "") +
+    theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        # axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, face = "bold")
+    )
+
+```
+
+## Export
+
+```{r export}
+
+# Export table 1, alluvial plots, and crosstables (for alluvial plot figures)
+
+
+# Alluvial plots as pdf:
+ggsave(
+    here("plots", "paper_alluvial.pdf"),
+    plot = wrap_plots(alluv_users, alluv_nonusers, guides = "collect"),
+    create.dir = TRUE,
+    dpi = 600,
+    device = "pdf",
+    width = 20,
+    height = 15,
+    unit = "cm"
+)
+ggsave(
+    here("plots", "paper_alluvial_weighted.pdf"),
+    plot = wrap_plots(weighted_alluv_users, weighted_alluv_nonusers, guides = "collect"),
+    create.dir = TRUE,
+    dpi = 600,
+    device = "pdf",
+    width = 20,
+    height = 15,
+    unit = "cm"
+)
+
+## Crosstables:
+
+# Unweighted
+dput(x = unweighted_crosstabs,
+     file = here("plots", "crosstab_unweighted.txt"))
+
+# Weighted
+dput(x = weighted_crosstabs,
+     file = here("plots", "crosstab_weighted.txt"))
+
+## Table 1:
+
+openxlsx::write.xlsx(
+    list(
+        "Base table" = basetable,
+        "Weighted basetable" = basetable_weighted,
+        "By baseline perception" = basetable_by_baseline_perception,
+        "crosstable_Users" = summary_crosstable_chatgpt,
+        "crosstable_Non-users" = summary_crosstable_nonusers
+    ),
+    file = here("plots", "basetables.xlsx"),
+    borders = "rows",
+    colWidths = "auto"
+)
+
+```
+
+## Run regression analyses and export estimates
+
+```{r export-estimates}
+
+
+# unweighted:
+dput(
+    x = dynamic_ref_regression_func(responses_weights, weights = NULL)[term == "chatgpt_useChatGPT use", .(
+        baseline_perception,
+        y.level,
+        term,
+        estimate,
+        conf.low,
+        conf.high,
+        estimates_label,
+        baseline_perception_empty,
+        p.value
+    )],
+    file = here("plots", "coef_tables_unweighted.txt")
+)
+
+# target pop weighted:
+dput(
+    x = dynamic_ref_regression_func(responses_weights, weights = "weights_invitees_rescaled")[term == "chatgpt_useChatGPT use", .(
+        baseline_perception,
+        y.level,
+        term,
+        estimate,
+        conf.low,
+        conf.high,
+        estimates_label,
+        baseline_perception_empty,
+        p.value
+    )],
+    file = here("plots", "coef_tables_weighted_invitees.txt")
+)
+
+# All estimates from main analysis - weighted to background population:
+dput(
+    x = dynamic_ref_regression_func(responses_weights, weights = "weights_background_rescaled")[, .(
+        baseline_perception,
+        y.level,
+        term,
+        estimate,
+        conf.low,
+        conf.high,
+        estimates_label,
+        baseline_perception_empty,
+        p.value
+    )],
+    file = here("plots", "all_coefs_weighted_background.txt")
+)
+```
+
